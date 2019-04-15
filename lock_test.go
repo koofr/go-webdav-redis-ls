@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/garyburd/redigo/redis"
-	"github.com/koofr/go-webdav"
+	webdav "github.com/koofr/go-webdav"
 	"gopkg.in/redsync.v1"
 )
 

@@ -6,13 +6,14 @@
 package webdavredisls
 
 import (
+	"errors"
 	"path"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/garyburd/redigo/redis"
-	"github.com/koofr/go-webdav"
+	webdav "github.com/koofr/go-webdav"
 )
 
 const (
@@ -144,12 +145,13 @@ func (r *RedisLS) collectExpiredNodes(conn redis.Conn, now time.Time) error {
 			if err != nil {
 				return err
 			}
-			if n == nil {
-				panic("Inconsistent state: collectExpiredNodes name not found: " + name)
-			}
-			err = r.remove(conn, n)
-			if err != nil {
-				return err
+			if n != nil {
+				err = r.remove(conn, n)
+				if err != nil {
+					return err
+				}
+			} else {
+				// inconsistent state. what do we do now?
 			}
 		}
 	}
@@ -207,7 +209,7 @@ func (r *RedisLS) Confirm(now time.Time, name0, name1 string, conditions ...webd
 	return func() {
 		err := r.mu.Lock()
 		if err != nil {
-			panic(err)
+			// TODO we should not just ignore the error
 		}
 		defer r.mu.Unlock()
 
@@ -217,15 +219,13 @@ func (r *RedisLS) Confirm(now time.Time, name0, name1 string, conditions ...webd
 			if n1 != nil {
 				err := r.unhold(conn, n1)
 				if err != nil {
-					// TODO we should not panic here but can't just ignore the error
-					panic(err)
+					// TODO we should not just ignore the error
 				}
 			}
 			if n0 != nil {
 				err := r.unhold(conn, n0)
 				if err != nil {
-					// TODO we should not panic here but can't just ignore the error
-					panic(err)
+					// TODO we should not just ignore the error
 				}
 			}
 		}
@@ -266,7 +266,7 @@ func (r *RedisLS) hold(conn redis.Conn, n *RedisLSNode) error {
 		return err
 	}
 	if heldStr == trueValue {
-		panic("webdav: RedisLS inconsistent held state")
+		return errors.New("webdav: RedisLS inconsistent held state")
 	}
 
 	_, err = r.connDo(conn, "HMSET", r.byNameKey(n.name), heldKey, trueValue)
@@ -290,7 +290,7 @@ func (r *RedisLS) unhold(conn redis.Conn, n *RedisLSNode) error {
 		return err
 	}
 	if heldStr != trueValue {
-		panic("webdav: RedisLS inconsistent held state")
+		return errors.New("webdav: RedisLS inconsistent held state")
 	}
 
 	_, err = r.connDo(conn, "HMSET", r.byNameKey(n.name), heldKey, falseValue)
