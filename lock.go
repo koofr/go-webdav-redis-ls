@@ -91,7 +91,11 @@ func (r *RedisLS) getByName(conn redis.Conn, name string) (*RedisLSNode, error) 
 		return nil, err
 	}
 	if vals[nameKey] == "" {
-		return nil, nil
+		if vals[expiryKey] == "" {
+			return nil, nil
+		} else {
+			vals[nameKey] = name
+		}
 	}
 
 	duration, _ := strconv.ParseInt(vals[durationKey], 10, 64)
