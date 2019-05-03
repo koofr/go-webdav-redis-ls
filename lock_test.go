@@ -13,14 +13,96 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-
 	"testing"
 	"time"
 
 	"github.com/garyburd/redigo/redis"
 	webdav "github.com/koofr/go-webdav"
-	"gopkg.in/redsync.v1"
 )
+
+type RedisLSNode struct {
+	name string
+	// details are the lock metadata. Even if this node's name is not explicitly locked,
+	// details.Root will still equal the node's name.
+	details webdav.LockDetails
+	// token is the unique identifier for this node's lock. An empty token means that
+	// this node is not explicitly locked.
+	token string
+	// refCount is the number of self-or-descendent nodes that are explicitly locked.
+	refCount int
+	// expiry is when this node's lock expires.
+	expiry time.Time
+	// held is whether this node's lock is actively held by a Confirm call.
+	held bool
+}
+
+func (r *RedisLS) redisLog(msg string) {
+	// for debugging in redis-cli with MONITOR
+	conn := r.pool.Get()
+	conn.Do("PING", "******** RedisLS log: "+msg)
+	conn.Close()
+}
+
+func (r *RedisLS) byNameKey(name string) string {
+	return r.prefix + namePrefix + name
+}
+
+func (r *RedisLS) byTokenKey(name string) string {
+	return r.prefix + tokenPrefix + name
+}
+
+func (r *RedisLS) getByName(conn redis.Conn, name string) (*RedisLSNode, error) {
+	res, err := conn.Do("HGETALL", r.byNameKey(name))
+	if err != nil {
+		return nil, err
+	}
+	vals, err := redis.StringMap(res, nil)
+	if err != nil {
+		return nil, err
+	}
+	if vals[nameKey] == "" {
+		if vals[expiryKey] == "" {
+			return nil, nil
+		} else {
+			vals[nameKey] = name
+		}
+	}
+
+	duration, _ := strconv.ParseInt(vals[durationKey], 10, 64)
+	expiry, _ := strconv.ParseInt(vals[expiryKey], 10, 64)
+	refCount, _ := strconv.ParseInt(vals[refCountKey], 10, 32)
+
+	ret := &RedisLSNode{
+		name: vals[nameKey],
+		details: webdav.LockDetails{
+			Root:      vals[rootKey],
+			Duration:  time.Duration(duration),
+			OwnerXML:  vals[ownerXMLKey],
+			ZeroDepth: vals[zeroDepthKey] == trueValue,
+		},
+		token:    vals[tokenKey],
+		refCount: int(refCount),
+		expiry:   time.Unix(expiry, 0),
+		held:     vals[heldKey] == trueValue,
+	}
+
+	return ret, nil
+}
+
+func (r *RedisLS) getByToken(conn redis.Conn, token string) (*RedisLSNode, error) {
+	tokenName, err := redis.String(conn.Do("GET", r.byTokenKey(token)))
+	if err != nil {
+		if err == redis.ErrNil {
+			return nil, nil
+		}
+		return nil, err
+	}
+	n, err := r.getByName(conn, tokenName)
+	if err != nil {
+		return nil, err
+	}
+	return n, nil
+}
 
 func getByName(r *RedisLS, name string) *RedisLSNode {
 	conn := r.pool.Get()
@@ -123,7 +205,7 @@ func byExpiryAll(r *RedisLS) []*RedisLSNode {
 	conn := r.pool.Get()
 	defer conn.Close()
 
-	names, err := redis.Strings(r.connDo(conn, "ZRANGEBYSCORE", r.expiryZSetKey, "-inf", "+inf"))
+	names, err := redis.Strings(conn.Do("ZRANGEBYSCORE", r.prefix+expiryZSetKey, "-inf", "+inf"))
 	if err != nil {
 		panic(err)
 	}
@@ -142,50 +224,6 @@ func byExpiryAll(r *RedisLS) []*RedisLSNode {
 	}
 
 	return res
-}
-
-func TestWalkToRoot(t *testing.T) {
-	testCases := []struct {
-		name string
-		want []string
-	}{{
-		"/a/b/c/d",
-		[]string{
-			"/a/b/c/d",
-			"/a/b/c",
-			"/a/b",
-			"/a",
-			"/",
-		},
-	}, {
-		"/a",
-		[]string{
-			"/a",
-			"/",
-		},
-	}, {
-		"/",
-		[]string{
-			"/",
-		},
-	}}
-
-	for _, tc := range testCases {
-		var got []string
-		if ok, _ := walkToRoot(tc.name, func(name0 string, first bool) (bool, error) {
-			if first != (len(got) == 0) {
-				t.Errorf("name=%q: first=%t but len(got)==%d", tc.name, first, len(got))
-				return false, nil
-			}
-			got = append(got, name0)
-			return true, nil
-		}); !ok {
-			continue
-		}
-		if !reflect.DeepEqual(got, tc.want) {
-			t.Errorf("name=%q:\ngot  %q\nwant %q", tc.name, got, tc.want)
-		}
-	}
 }
 
 var lockTestDurations = []time.Duration{
@@ -250,9 +288,6 @@ func NewTestRedisLS() *RedisLS {
 
 	prefix := "webdavredislstest:"
 
-	rs := redsync.New([]redsync.Pool{pool})
-	mutex := rs.NewMutex("webdavredislstest:mutex")
-
 	conn := pool.Get()
 	defer conn.Close()
 
@@ -268,137 +303,10 @@ func NewTestRedisLS() *RedisLS {
 		}
 	}
 
-	return NewRedisLS(pool, prefix, mutex)
+	return NewRedisLS(pool, prefix)
 }
 
-func TestMemLSCanCreate(t *testing.T) {
-	now := time.Unix(0, 0)
-	r := NewTestRedisLS()
-	conn := r.pool.Get()
-	defer conn.Close()
-
-	for _, name := range lockTestNames {
-		_, err := r.Create(now, webdav.LockDetails{
-			Root:      name,
-			Duration:  infiniteTimeout,
-			ZeroDepth: lockTestZeroDepth(name),
-		})
-		if err != nil {
-			t.Fatalf("creating lock for %q: %v", name, err)
-		}
-	}
-
-	wantCanCreate := func(name string, zeroDepth bool) bool {
-		for _, n := range lockTestNames {
-			switch {
-			case n == name:
-				// An existing lock has the same name as the proposed lock.
-				return false
-			case strings.HasPrefix(n, name):
-				// An existing lock would be a child of the proposed lock,
-				// which conflicts if the proposed lock has infinite depth.
-				if !zeroDepth {
-					return false
-				}
-			case strings.HasPrefix(name, n):
-				// An existing lock would be an ancestor of the proposed lock,
-				// which conflicts if the ancestor has infinite depth.
-				if n[len(n)-1] == 'i' {
-					return false
-				}
-			}
-		}
-		return true
-	}
-
-	var check func(int, string)
-	check = func(recursion int, name string) {
-		for _, zeroDepth := range []bool{false, true} {
-			got, err := r.canCreate(conn, name, zeroDepth)
-			if err != nil {
-				panic(err)
-			}
-			want := wantCanCreate(name, zeroDepth)
-			if got != want {
-				t.Errorf("canCreate name=%q zeroDepth=%t: got %t, want %t", name, zeroDepth, got, want)
-			}
-		}
-		if recursion == 6 {
-			return
-		}
-		if name != "/" {
-			name += "/"
-		}
-		for _, c := range "_iz" {
-			check(recursion+1, name+string(c))
-		}
-	}
-	check(0, "/")
-
-	if err := r.consistent(); err != nil {
-		t.Fatalf("TestMemLSCanCreate: inconsistent state: %v", err)
-	}
-}
-
-func TestMemLSLookup(t *testing.T) {
-	now := time.Unix(0, 0)
-	r := NewTestRedisLS()
-
-	conn := r.pool.Get()
-	defer conn.Close()
-
-	badToken, err := r.nextToken(conn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("badToken=%q", badToken)
-
-	for _, name := range lockTestNames {
-		token, err := r.Create(now, webdav.LockDetails{
-			Root:      name,
-			Duration:  infiniteTimeout,
-			ZeroDepth: lockTestZeroDepth(name),
-		})
-		if err != nil {
-			t.Fatalf("creating lock for %q: %v", name, err)
-		}
-		t.Logf("%-15q -> node=%p token=%q", name, getByName(r, name), token)
-	}
-
-	baseNames := append([]string{"/a", "/b/c"}, lockTestNames...)
-	for _, baseName := range baseNames {
-		for _, suffix := range []string{"", "/0", "/1/2/3"} {
-			name := baseName + suffix
-
-			goodToken := ""
-			base := getByName(r, baseName)
-			if base != nil && (suffix == "" || !lockTestZeroDepth(baseName)) {
-				goodToken = base.token
-			}
-
-			for _, token := range []string{badToken, goodToken} {
-				if token == "" {
-					continue
-				}
-
-				got, err := r.lookup(conn, name, webdav.Condition{Token: token})
-				if err != nil {
-					panic(err)
-				}
-				want := base
-				if token == badToken {
-					want = nil
-				}
-				if !reflect.DeepEqual(got, want) {
-					t.Errorf("name=%-20qtoken=%q (bad=%t): got %p, want %p",
-						name, token, token == badToken, got, want)
-				}
-			}
-		}
-	}
-}
-
-func TestMemLSConfirm(t *testing.T) {
+func TestRedisLSConfirm(t *testing.T) {
 	now := time.Unix(0, 0)
 	r := NewTestRedisLS()
 	alice, err := r.Create(now, webdav.LockDetails{
@@ -490,7 +398,7 @@ func TestMemLSConfirm(t *testing.T) {
 	}
 }
 
-func TestMemLSNonCanonicalRoot(t *testing.T) {
+func TestRedisLSNonCanonicalRoot(t *testing.T) {
 	now := time.Unix(0, 0)
 	r := NewTestRedisLS()
 	token, err := r.Create(now, webdav.LockDetails{
@@ -511,7 +419,7 @@ func TestMemLSNonCanonicalRoot(t *testing.T) {
 	}
 }
 
-func TestMemLSExpiry(t *testing.T) {
+func TestRedisLSExpiry(t *testing.T) {
 	r := NewTestRedisLS()
 
 	conn := r.pool.Get()
@@ -619,8 +527,14 @@ func TestMemLSExpiry(t *testing.T) {
 			now = time.Unix(0, 0).Add(time.Duration(d) * time.Second)
 
 		case "want":
-			r.mu.Lock()
-			err := r.collectExpiredNodes(conn, now)
+			collectExpiredNodesScript := redis.NewScript(0,
+				GetParentPathFunc+
+					RemoveFunc+
+					CollectExpiredNodesFunc+
+					`return collect_expired_nodes(ARGV[1], tonumber(ARGV[2]))`,
+			)
+
+			_, err := collectExpiredNodesScript.Do(conn, r.prefix, now.Unix())
 			if err != nil {
 				panic(err)
 			}
@@ -629,7 +543,6 @@ func TestMemLSExpiry(t *testing.T) {
 				got = append(got, fmt.Sprintf("%s.%d",
 					n.details.Root, n.expiry.Sub(zTime)/time.Second))
 			}
-			r.mu.Unlock()
 			sort.Strings(got)
 			want := []string{}
 			if arg != "" {
@@ -646,7 +559,7 @@ func TestMemLSExpiry(t *testing.T) {
 	}
 }
 
-func TestMemLS(t *testing.T) {
+func TestRedisLS(t *testing.T) {
 	now := time.Unix(0, 0)
 	r := NewTestRedisLS()
 	rng := rand.New(rand.NewSource(0))
@@ -733,8 +646,8 @@ func TestMemLS(t *testing.T) {
 }
 
 func (r *RedisLS) consistent() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.redisLog("consistent start")
+	defer r.redisLog("consistent end")
 
 	// If r.byName is non-empty, then it must contain an entry for the root "/",
 	// and its refCount should equal the number of locked nodes.
