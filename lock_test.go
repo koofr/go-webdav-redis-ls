@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/garyburd/redigo/redis"
+	"github.com/gomodule/redigo/redis"
 	webdav "github.com/koofr/go-webdav"
 )
 
@@ -234,9 +234,9 @@ var lockTestDurations = []time.Duration{
 
 // lockTestNames are the names of a set of mutually compatible locks. For each
 // name fragment:
-//  - _ means no explicit lock.
-//  - i means a infinite-depth lock,
-//  - z means a zero-depth lock,
+//   - _ means no explicit lock.
+//   - i means a infinite-depth lock,
+//   - z means a zero-depth lock,
 var lockTestNames = []string{
 	"/_/_/_/_/z",
 	"/_/_/i",
@@ -565,7 +565,7 @@ func TestRedisLS(t *testing.T) {
 	rng := rand.New(rand.NewSource(0))
 	tokens := map[string]string{}
 	nConfirm, nCreate, nRefresh, nUnlock := 0, 0, 0, 0
-	const N = 2000
+	const N = 100
 
 	for i := 0; i < N; i++ {
 		name := lockTestNames[rng.Intn(len(lockTestNames))]

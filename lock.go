@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/garyburd/redigo/redis"
+	"github.com/gomodule/redigo/redis"
 	webdav "github.com/koofr/go-webdav"
 )
 

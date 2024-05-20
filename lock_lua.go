@@ -1,6 +1,6 @@
 package webdavredisls
 
-import "github.com/garyburd/redigo/redis"
+import "github.com/gomodule/redigo/redis"
 
 func nameKeyMacro(nameVar string) string {
 	return `(prefix .. "` + namePrefix + `" .. ` + nameVar + `)`
